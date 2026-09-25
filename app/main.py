@@ -174,13 +174,22 @@ def analyze(req: AnalyzeRequest) -> dict[str, Any]:
     """Analyze a rule set.
 
     The analysis is deterministic: identical inputs always produce the same
-    ``ruleset_hash`` and the same ``id``. Saving is idempotent, even under
-    concurrent submission: the first successful save of a given ruleset hash
-    creates the immutable version (and its rules/findings) and every later
-    save — including requests racing the first one — is reused as-is. The
-    response metadata of every successful request is therefore the stored
-    version's ``id``/``name``/``created_at`` (a duplicate's own ``name`` is
-    ignored), matching GET /api/analyses/{id} and the version list.
+    ``ruleset_hash`` and the same ``id``. The fingerprint also ignores
+    reorderings that cannot change the verdict — rules are canonicalized by
+    (CIDR, priority) before hashing, so swapping the submission order of
+    different-CIDR rules (or of same-CIDR rules with different priorities)
+    yields the same hash, while the relative order of same-CIDR same-priority
+    rules — the tie-break that decides the winning ``rule_id`` — is preserved
+    and still distinguishes fingerprints. Rules submitted without an explicit
+    ``rule_id`` are fingerprinted by their generated positional ids.
+
+    Saving is idempotent, even under concurrent submission: the first
+    successful save of a given ruleset hash creates the immutable version (and
+    its rules/findings) and every later save — including requests racing the
+    first one — is reused as-is. The response of every successful save is
+    therefore the stored version itself, with the stored ``id``/``name``/
+    ``created_at`` (a duplicate's own ``name`` and rule order are ignored),
+    matching GET /api/analyses/{id} and the version list.
     """
     raw_rules = [r.model_dump(exclude_defaults=False) for r in req.rules]
     # model_dump turns unset rule_id into None; the analyzer assigns r1, r2...
@@ -189,13 +198,23 @@ def analyze(req: AnalyzeRequest) -> dict[str, Any]:
     analysis_id = _make_id(result["ruleset_hash"])
     if req.save:
         saved = db.save_analysis(analysis_id, req.name, result)
+        if saved["reused"]:
+            # A duplicate submission reuses the first saved version verbatim:
+            # respond with the stored analysis (its rule order, indexes and
+            # metadata) rather than the freshly computed, possibly reordered
+            # one, so a duplicate's response is identical to the first save's.
+            stored = db.get_analysis(saved["id"])
+            if stored is not None:
+                result = stored
         result["id"] = saved["id"]
         result["name"] = saved["name"]
         result["created_at"] = saved["created_at"]
         result["persisted"] = True
     else:
         # Analysis only: nothing is written, so the response carries the
-        # request-supplied name and a fresh timestamp rather than stored metadata.
+        # request-supplied name and a fresh timestamp rather than stored
+        # metadata. The id/ruleset_hash are the same fingerprint a save would
+        # compute, so a dry run and a save of the same ruleset agree.
         result["id"] = analysis_id
         result["name"] = req.name
         result["created_at"] = db.utc_now_iso()

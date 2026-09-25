@@ -11,7 +11,10 @@ IPv4/IPv6 CIDR 规则，服务端按 **最长前缀匹配（LPM）+ 同前缀优
 - **优先级反转（priority inversion）**：长前缀仅凭前缀长度（而非更高优先级数字）覆盖短前缀
   且改变动作时给出提示。
 
-分析结果是**确定性**的：相同输入得到相同 `ruleset_hash` 与版本 `id`。支持保存分析版本、
+分析结果是**确定性**的：相同输入得到相同 `ruleset_hash` 与版本 `id`；指纹还会忽略
+**不影响裁决的重排**——仅交换不同 CIDR 规则的提交顺序（如 `permit /8` 与 `deny /16`）
+得到同一指纹、同一版本，而同 CIDR 同 `priority` 规则的相对顺序仍会区分指纹（详见
+[“指纹规则与幂等”](#指纹规则与幂等ruleset_hash)）。支持保存分析版本、
 按条件查询规则/发现、导出 JSON，并通过一个带乐观锁（`revision`）的**发布指针**在已保存
 版本之间安全切换，切换历史只增可查。相同规则集的重复保存（包括并发提交）是**幂等**的：
 只保留首次保存的版本与元数据，见下文[“重复提交语义（幂等）”](#重复提交语义幂等)。
@@ -186,22 +189,25 @@ curl -s -X POST http://localhost:8080/api/analyze \
 
 ### 重复提交语义（幂等）
 
-`POST /api/analyze` 默认 `save: true`。版本以规则集内容的 `ruleset_hash` 去重：
+`POST /api/analyze` 默认 `save: true`。版本以规则集内容的 `ruleset_hash` 去重；指纹在
+计算前会把规则按 (CIDR, priority) 规范化排序，因此**不影响裁决的重排**（如仅交换不同
+CIDR 规则的提交顺序）得到相同哈希、同一个版本（详见下文[“指纹规则与幂等”](#指纹规则与幂等ruleset_hash)）。
 
 - **首次保存**：创建一个不可变版本（`analyses` 一行，外加该版本的 rules / findings
   记录），响应的 `id` 为 `an_` + 哈希前 16 位，`name` 为请求携带的 `name`，
   `created_at` 为首次保存时刻。
-- **重复提交**（相同规则集再次提交，无论是否携带不同的 `name`）：**不会**创建新版本，
-  数据库中仍然只有一份 analyses/rules/findings；响应直接返回**首次保存版本**的
-  `id`、`name`、`created_at`——重复请求自带的 `name` 被忽略，`persisted` 仍为 `true`。
-  该响应与 `GET /api/analyses/{id}` 及 `GET /api/analyses` 版本列表中的元数据完全一致。
+- **重复提交**（相同规则集——包括仅按不影响裁决的顺序重排后——再次提交，无论是否携带
+  不同的 `name`）：**不会**创建新版本，数据库中仍然只有一份 analyses/rules/findings；
+  响应直接返回**首次保存的版本本身**（其规则顺序与 `id`、`name`、`created_at`）——
+  重复请求自带的 `name` 与规则顺序被忽略，`persisted` 仍为 `true`。该响应与
+  `GET /api/analyses/{id}` 及 `GET /api/analyses` 版本列表中的元数据完全一致。
 - **并发重复提交**：多个携带相同规则集的保存请求同时到达时，去重在单个 SQLite
   写事务内原子完成（配合 `ruleset_hash` 唯一索引）：恰好一个请求完成插入，其余请求
   全部复用同一已保存版本，所有成功响应拿到**同一个 `id`**，只产生一份
   analyses/rules/findings，不会返回服务错误。
-- `save: false` 时只做分析、不写库：每次都返回按请求参数生成的响应（`id` 仍由哈希
-  确定性推导、`name` 取请求值、`created_at` 为本次时间），`persisted: false`，数据库
-  中不产生任何记录。
+- `save: false` 时只做分析、不写库：每次都返回按请求参数生成的响应（`id` 仍由**与保存时
+  一致的指纹哈希**确定性推导、`name` 取请求值、`created_at` 为本次时间），
+  `persisted: false`，数据库中不产生任何记录。
 
 ### 查询与导出
 
@@ -1386,6 +1392,7 @@ curl -s "http://localhost:8080/api/active/history?limit=50&offset=0"
 │   ├── db.py            # SQLite 持久层（analyses / rules / findings / active_pointer / active_history 五表）
 │   └── main.py          # FastAPI 路由
 ├── tests/test_api.py           # 端到端测试（pytest + TestClient）
+├── tests/test_fingerprint.py   # 规则集指纹（ruleset_hash）规范化：忽略不影响裁决的重排、保留同 CIDR 同优先级相对顺序、版本去重
 ├── tests/test_containment_index.py # 包含树前缀索引测试（稀疏/嵌套性能与结果、与 O(n²) 扫描等价、analyze 与预演一致）
 ├── tests/test_active.py        # 发布指针与乐观锁（含并发发布）测试
 ├── tests/test_diff.py          # 语义差异端点测试
@@ -1426,11 +1433,27 @@ curl -s "http://localhost:8080/api/active/history?limit=50&offset=0"
 
 `covered` 以十进制文本存储，以容纳超出 64 位整数范围的 IPv6 地址计数（如 /32 的 2^96）。
 
-### 确定性 / 幂等
+### 指纹规则与幂等（ruleset_hash）
 
-版本 ID = `an_` + `sha256(规范化输入)` 的前 16 个十六进制字符。规范化输入包含
-`rule_id / cidr / action / priority / source_tag`，与提交顺序无关地以规范 JSON
-（排序键、无空白）序列化。重复提交同一规则集返回**同一个版本 ID**，数据库中只存一份。
+版本 ID = `an_` + `sha256(规范化输入)` 的前 16 个十六进制字符，`ruleset_hash` 即该
+sha256。规范化输入由每条规则的 `rule_id / cidr / action / priority / source_tag` 组成；
+序列化前先把规则做**规范化排序**——按 CIDR（地址族、网络地址、前缀长度）再按
+`priority` 的**稳定排序**——然后以规范 JSON（排序键、无空白）输出。因此指纹
+**忽略一切不影响裁决的重排**，同时保留一切影响裁决的相对顺序：
+
+- **不同 CIDR** 的规则互换提交顺序（如 `permit 10.0.0.0/8` 与 `deny 10.1.0.0/16`）：
+  跨网段裁决只看最长前缀匹配，与提交顺序无关 → **指纹相同**，重复保存复用同一版本；
+- **同 CIDR、不同 priority** 的规则互换顺序：胜出者由 `priority` 唯一决定 →
+  **指纹相同**；
+- **同 CIDR、同 priority** 的规则互换顺序：输入顺序是同网段裁决的决胜条件，决定胜出
+  `rule_id`——稳定排序保留其相对顺序 → **指纹不同**，不会误合并；
+- **未显式给 `rule_id`** 的规则按生成后的位置 ID（`r1, r2, ...`）参与指纹：重排会改变
+  各规则分到的生成 ID → **指纹仍不同**。
+
+`save: true` 与 `save: false` 对同一规则集计算**同一个指纹**（`save: false` 响应的
+`id` 同样由该哈希推导，只是不落库）。重复保存——包括重排后的等价规则集与并发提交——
+复用**首次保存的版本及其元数据**：响应就是首次保存版本本身（其规则顺序、`id`、`name`、
+`created_at`），数据库中始终只有一份 analyses/rules/findings。
 
 ### 复杂度
 

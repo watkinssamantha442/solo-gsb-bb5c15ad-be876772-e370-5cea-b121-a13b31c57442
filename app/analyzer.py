@@ -287,7 +287,42 @@ def _link_containment_tree(version: int, version_nodes: list[Node]) -> None:
 # ---------------------------------------------------------------------------
 # Canonicalization / idempotency hash
 # ---------------------------------------------------------------------------
+def _canonical_order(rules: list[InputRule]) -> list[InputRule]:
+    """Order rules for the fingerprint so verdict-neutral reorderings collapse.
+
+    The verdict (which rule wins each address, hence every finding and minimal
+    pair) depends on submission order in exactly one place: ties between rules
+    carrying the *same CIDR and the same priority* are broken by input order.
+    Everywhere else order is irrelevant — longest-prefix match adjudicates
+    across different CIDRs, and ``priority`` alone adjudicates same-CIDR rules
+    with different priorities.
+
+    Sorting by network, then priority, with a *stable* sort therefore erases
+    precisely the reorderings that cannot change the verdict, while the
+    relative order inside a (CIDR, priority) class is preserved: swapping two
+    same-CIDR same-priority rules still yields a different canonical payload,
+    because their relative order decides the winning ``rule_id``.
+    """
+    return sorted(
+        rules,
+        key=lambda r: (
+            r.network.version,
+            int(r.network.network_address),
+            r.network.prefixlen,
+            r.priority,
+        ),
+    )
+
+
 def canonical_input(rules: list[InputRule]) -> str:
+    """Canonical JSON fingerprint input of a parsed rule set.
+
+    Each entry carries the *final* ``rule_id`` — explicitly supplied or
+    generated positionally (``r1``, ``r2``, ...).  Generated ids are therefore
+    part of the fingerprint: reordering rules that were submitted without
+    explicit ids reshuffles which rule wears which generated id, and such
+    reorderings still fingerprint differently.
+    """
     payload = [
         {
             "rule_id": r.rule_id,
@@ -296,7 +331,7 @@ def canonical_input(rules: list[InputRule]) -> str:
             "priority": r.priority,
             "source_tag": r.source_tag,
         }
-        for r in rules
+        for r in _canonical_order(rules)
     ]
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
