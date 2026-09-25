@@ -174,13 +174,21 @@ def analyze(req: AnalyzeRequest) -> dict[str, Any]:
     """Analyze a rule set.
 
     The analysis is deterministic: identical inputs always produce the same
-    ``ruleset_hash`` and the same ``id``. Saving is idempotent, even under
-    concurrent submission: the first successful save of a given ruleset hash
-    creates the immutable version (and its rules/findings) and every later
-    save — including requests racing the first one — is reused as-is. The
-    response metadata of every successful request is therefore the stored
-    version's ``id``/``name``/``created_at`` (a duplicate's own ``name`` is
-    ignored), matching GET /api/analyses/{id} and the version list.
+    ``ruleset_hash`` and the same ``id``.  The fingerprint ignores submission
+    order wherever order cannot change the verdict — reordering rules with
+    different CIDRs (or the same CIDR at different priorities) hashes
+    identically — while the relative order of same-CIDR, same-priority rules
+    stays part of the fingerprint because it decides the winning ``rule_id``.
+    Rules without an explicit ``rule_id`` are fingerprinted by their
+    generated positional ids (``r1``, ``r2``, ...).  Saving is idempotent,
+    even under concurrent submission: the first successful save of a given
+    ruleset hash creates the immutable version (and its rules/findings) and
+    every later save — including requests racing the first one — is reused
+    as-is.  The response metadata of every successful request is therefore
+    the stored version's ``id``/``name``/``created_at`` (a duplicate's own
+    ``name`` is ignored), matching GET /api/analyses/{id} and the version
+    list.  ``save: false`` computes the very same fingerprint without
+    writing anything.
     """
     raw_rules = [r.model_dump(exclude_defaults=False) for r in req.rules]
     # model_dump turns unset rule_id into None; the analyzer assigns r1, r2...

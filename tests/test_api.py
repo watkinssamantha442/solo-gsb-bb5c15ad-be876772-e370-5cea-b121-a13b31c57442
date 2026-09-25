@@ -393,3 +393,112 @@ def test_save_false_name_is_reflected_without_persisting(client: TestClient) -> 
     assert data["name"] == "draft-only"
     assert data["persisted"] is False
     assert client.get("/api/analyses").json()["total"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Fingerprint canonicalization: verdict-neutral reordering dedups to one
+# version; verdict-relevant order (same CIDR + same priority) must not merge.
+# ---------------------------------------------------------------------------
+def test_reordered_distinct_cidrs_share_one_version(client: TestClient) -> None:
+    # Swapping the submission order of different-CIDR rules (permit /8 vs
+    # deny /16) cannot change the verdict, so both submissions fingerprint
+    # identically and the second save reuses the first version + metadata.
+    rules = [
+        {"rule_id": "p8", "cidr": "10.0.0.0/8", "action": "permit", "priority": 100},
+        {"rule_id": "d16", "cidr": "10.1.0.0/16", "action": "deny", "priority": 200},
+        {"rule_id": "p24", "cidr": "10.1.1.0/24", "action": "permit", "priority": 50},
+    ]
+    first = client.post("/api/analyze", json={"name": "first", "rules": rules}).json()
+    second = client.post(
+        "/api/analyze",
+        json={"name": "second-name", "rules": list(reversed(rules))},
+    ).json()
+
+    assert second["ruleset_hash"] == first["ruleset_hash"]
+    assert second["id"] == first["id"]
+    # The duplicate's own name is ignored; stored metadata wins.
+    assert second["name"] == "first"
+    assert second["created_at"] == first["created_at"]
+    assert second["persisted"] is True
+
+    assert client.get("/api/analyses").json()["total"] == 1
+    fetched = client.get(f"/api/analyses/{first['id']}").json()
+    assert fetched["ruleset_hash"] == first["ruleset_hash"]
+
+
+def test_reordered_same_cidr_different_priority_shares_version(client: TestClient) -> None:
+    # Same CIDR but different priorities: priority alone picks the winner, so
+    # the relative submission order is verdict-neutral and dedups.
+    rules = [
+        {"rule_id": "lo", "cidr": "192.0.2.0/24", "action": "deny", "priority": 200},
+        {"rule_id": "hi", "cidr": "192.0.2.0/24", "action": "permit", "priority": 100},
+    ]
+    first = client.post("/api/analyze", json={"rules": rules}).json()
+    second = client.post("/api/analyze", json={"rules": list(reversed(rules))}).json()
+
+    assert second["ruleset_hash"] == first["ruleset_hash"]
+    assert second["id"] == first["id"]
+    assert client.get("/api/analyses").json()["total"] == 1
+
+
+def test_reordered_same_cidr_same_priority_stays_distinct(client: TestClient) -> None:
+    # Same CIDR *and* same priority: submission order picks the winning
+    # rule_id, so swapping changes the verdict and must produce two versions.
+    rules = [
+        {"rule_id": "x", "cidr": "192.0.2.0/24", "action": "permit", "priority": 100},
+        {"rule_id": "y", "cidr": "192.0.2.0/24", "action": "deny", "priority": 100},
+    ]
+    first = client.post("/api/analyze", json={"rules": rules}).json()
+    second = client.post("/api/analyze", json={"rules": list(reversed(rules))}).json()
+
+    assert first["ruleset_hash"] != second["ruleset_hash"]
+    assert first["id"] != second["id"]
+    winner_first = next(r for r in first["rules"] if r["role"] == "winner")
+    winner_second = next(r for r in second["rules"] if r["role"] == "winner")
+    assert winner_first["rule_id"] == "x"
+    assert winner_second["rule_id"] == "y"
+    assert client.get("/api/analyses").json()["total"] == 2
+
+
+def test_unlabeled_rules_are_distinguished_by_generated_ids(client: TestClient) -> None:
+    # Without explicit rule_id the generated ids r1, r2, ... are positional:
+    # a swapped submission binds different content to the same generated id,
+    # so the two rule sets fingerprint differently.
+    rules = [
+        {"cidr": "10.0.0.0/8", "action": "permit"},
+        {"cidr": "10.1.0.0/16", "action": "deny"},
+    ]
+    first = client.post("/api/analyze", json={"rules": rules}).json()
+    second = client.post("/api/analyze", json={"rules": list(reversed(rules))}).json()
+
+    assert first["ruleset_hash"] != second["ruleset_hash"]
+    assert first["id"] != second["id"]
+    # Identical submission still dedups onto the first version.
+    third = client.post("/api/analyze", json={"rules": rules}).json()
+    assert third["id"] == first["id"]
+    assert client.get("/api/analyses").json()["total"] == 2
+
+
+def test_save_false_and_save_true_compute_the_same_fingerprint(client: TestClient) -> None:
+    rules = [
+        {"rule_id": "d16", "cidr": "10.1.0.0/16", "action": "deny", "priority": 100},
+        {"rule_id": "p8", "cidr": "10.0.0.0/8", "action": "permit", "priority": 100},
+    ]
+    preview = client.post("/api/analyze", json={"rules": rules, "save": False}).json()
+    assert preview["persisted"] is False
+    assert client.get("/api/analyses").json()["total"] == 0
+
+    # The same ruleset in a different order, now persisted: identical
+    # fingerprint and version id as the unsaved preview.
+    saved = client.post(
+        "/api/analyze", json={"rules": list(reversed(rules)), "save": True}
+    ).json()
+    assert saved["persisted"] is True
+    assert saved["ruleset_hash"] == preview["ruleset_hash"]
+    assert saved["id"] == preview["id"]
+
+    # A later save of the same ruleset reuses the first saved version.
+    again = client.post("/api/analyze", json={"rules": rules, "save": True}).json()
+    assert again["id"] == saved["id"]
+    assert again["created_at"] == saved["created_at"]
+    assert client.get("/api/analyses").json()["total"] == 1

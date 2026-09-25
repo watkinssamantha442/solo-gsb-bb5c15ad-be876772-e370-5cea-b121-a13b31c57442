@@ -287,6 +287,30 @@ def _link_containment_tree(version: int, version_nodes: list[Node]) -> None:
 # ---------------------------------------------------------------------------
 # Canonicalization / idempotency hash
 # ---------------------------------------------------------------------------
+def _canonical_order(rules: list[InputRule]) -> list[InputRule]:
+    """Order rules for the fingerprint so verdict-neutral reorderings vanish.
+
+    The adjudication outcome depends on the submission order of two rules
+    *only* when they carry the exact same CIDR and the same priority (input
+    order is the final same-CIDR tie-break, so it decides the winning
+    ``rule_id``).  Every other relative order — different CIDRs, or the same
+    CIDR with different priorities — is irrelevant to the verdict, so sorting
+    by ``(family, network address, prefix length, priority)`` erases it from
+    the fingerprint.  The sort is stable: same-CIDR same-priority rules keep
+    their submission order inside the canonical payload, and swapping them
+    still yields a different hash.
+    """
+    return sorted(
+        rules,
+        key=lambda r: (
+            r.network.version,
+            int(r.network.network_address),
+            r.network.prefixlen,
+            r.priority,
+        ),
+    )
+
+
 def canonical_input(rules: list[InputRule]) -> str:
     payload = [
         {
@@ -296,7 +320,7 @@ def canonical_input(rules: list[InputRule]) -> str:
             "priority": r.priority,
             "source_tag": r.source_tag,
         }
-        for r in rules
+        for r in _canonical_order(rules)
     ]
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
